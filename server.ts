@@ -277,7 +277,8 @@ async function startServer() {
           const sock = (makeWASocket as any)({
             auth: state,
             printQRInTerminal: true,
-            logger: (pino as any)({ level: "silent" })
+            logger: (pino as any)({ level: "silent" }),
+            browser: ["Linux", "Chrome", "116.0.0.0"]
           });
 
           sock.ev.on("creds.update", saveCreds);
