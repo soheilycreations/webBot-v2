@@ -266,156 +266,165 @@ async function startServer() {
 
       } else {
         // Real Baileys Integration
-        try {
-          // Import Baileys dynamically to handle environments with dependency issues gracefully
-          const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = await import("@whiskeysockets/baileys");
-          const { default: pino } = await import("pino");
+        const startBaileysConn = async () => {
+          try {
+            // Import Baileys dynamically to handle environments with dependency issues gracefully
+            const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = await import("@whiskeysockets/baileys");
+            const { default: pino } = await import("pino");
 
-          const authPath = path.join(process.cwd(), `auth_info_${shopId}`);
-          const { state, saveCreds } = await useMultiFileAuthState(authPath);
+            const authPath = path.join(process.cwd(), `auth_info_${shopId}`);
+            const { state, saveCreds } = await useMultiFileAuthState(authPath);
 
-          const sock = (makeWASocket as any)({
-            auth: state,
-            printQRInTerminal: true,
-            logger: (pino as any)({ level: "silent" }),
-            browser: ["Linux", "Chrome", "116.0.0.0"]
-          });
+            const sock = (makeWASocket as any)({
+              auth: state,
+              printQRInTerminal: true,
+              logger: (pino as any)({ level: "silent" }),
+              browser: ["Linux", "Chrome", "116.0.0.0"]
+            });
 
-          sock.ev.on("creds.update", saveCreds);
+            sock.ev.on("creds.update", saveCreds);
 
-          sock.ev.on("connection.update", async (update) => {
-            const { connection, lastDisconnect, qr } = update;
-            
-            if (qr) {
-              console.log(`Shop ${shopId} Baileys QR Code:`, qr);
-              const current = activeSessions.get(shopId);
-              if (current) {
-                current.status = "qr_received";
-                current.qrCode = qr;
-                activeSessions.set(shopId, current);
-              }
-              io.to(`shop_${shopId}`).emit("status_change", {
-                status: "qr_received",
-                qrCode: qr
-              });
-              io.to(`shop_${shopId}`).emit("log", {
-                type: "info",
-                message: `[Baileys Real Auth] Received raw QR string from WhatsApp Web service.`
-              });
-            }
-
-            if (connection === "close") {
-              const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
-              console.log(`Baileys connection closed for shop ${shopId}. Reconnecting: ${shouldReconnect}`, lastDisconnect?.error);
+            sock.ev.on("connection.update", async (update) => {
+              const { connection, lastDisconnect, qr } = update;
               
-              const current = activeSessions.get(shopId);
-              if (current) {
-                current.status = "disconnected";
-                delete current.qrCode;
-                activeSessions.set(shopId, current);
-              }
-              io.to(`shop_${shopId}`).emit("status_change", { status: "disconnected" });
-              io.to(`shop_${shopId}`).emit("log", {
-                type: "warn",
-                message: `[Baileys Service] Connection closed. Reason: ${lastDisconnect?.error?.message || "Unknown error"}. Clean reconnect: ${shouldReconnect}`
-              });
-
-              if (shouldReconnect) {
-                // In production, we'd loop around, but for the PoC we let user click Connect again or queue reconnect.
+              if (qr) {
+                console.log(`Shop ${shopId} Baileys QR Code:`, qr);
+                const current = activeSessions.get(shopId);
+                if (current) {
+                  current.status = "qr_received";
+                  current.qrCode = qr;
+                  activeSessions.set(shopId, current);
+                }
+                io.to(`shop_${shopId}`).emit("status_change", {
+                  status: "qr_received",
+                  qrCode: qr
+                });
                 io.to(`shop_${shopId}`).emit("log", {
                   type: "info",
-                  message: `[Baileys Service] Re-establishing connection context...`
+                  message: `[Baileys Real Auth] Received raw QR string from WhatsApp Web service.`
                 });
               }
-            } else if (connection === "open") {
-              console.log(`Baileys connection opened successfully for shop ${shopId}`);
-              const current = activeSessions.get(shopId);
-              if (current) {
-                current.status = "connected";
-                delete current.qrCode;
-                activeSessions.set(shopId, current);
-              }
-              io.to(`shop_${shopId}`).emit("status_change", { status: "connected" });
-              io.to(`shop_${shopId}`).emit("log", {
-                type: "success",
-                message: `[WhatsApp Web Server] Successfully logged in using secure multi-file session auth!`
-              });
-            }
-          });
 
-          sock.ev.on("messages.upsert", async (m) => {
-            console.log(`Incoming message on shop ${shopId}:`, JSON.stringify(m, null, 2));
-            const msg = m.messages[0];
-            if (!msg.key.fromMe && msg.message) {
-              const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
-              const sender = msg.key.remoteJid;
-              if (textMessage) {
+              if (connection === "close") {
+                const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
+                console.log(`Baileys connection closed for shop ${shopId}. Reconnecting: ${shouldReconnect}`, lastDisconnect?.error);
+                
+                const current = activeSessions.get(shopId);
+                if (current) {
+                  current.status = "disconnected";
+                  delete current.qrCode;
+                  activeSessions.set(shopId, current);
+                }
+                io.to(`shop_${shopId}`).emit("status_change", { status: "disconnected" });
                 io.to(`shop_${shopId}`).emit("log", {
-                  type: "message",
-                  message: `[INCOMING] Message from ${sender}: "${textMessage}"`
+                  type: "warn",
+                  message: `[Baileys Service] Connection closed. Reason: ${lastDisconnect?.error?.message || "Unknown error"}. Clean reconnect: ${shouldReconnect}`
                 });
 
-                // Sync inbound message log to Supabase
-                const isSyncedIn = await syncToSupabase(shopId, sender || "unknown", textMessage, 'inbound');
-                if (isSyncedIn) {
+                if (shouldReconnect) {
                   io.to(`shop_${shopId}`).emit("log", {
                     type: "info",
-                    message: `[Supabase DB Sync] Persisted WhatsApp Inbound conversation to chat_logs`
+                    message: `[Baileys Service] Re-establishing connection context...`
                   });
-                }
-
-                // Query the configured OpenRouter LLM or fallback Match rules
-                const aiResponse = await queryOpenRouter(shopId, textMessage);
-
-                // Auto-reply with AI generated response
-                setTimeout(async () => {
-                  try {
-                    await sock.sendMessage(sender!, { text: aiResponse });
-                    io.to(`shop_${shopId}`).emit("log", {
-                      type: "success",
-                      message: `[OUTBOUND AUTO-REPLY] ${aiResponse}`
+                  setTimeout(() => {
+                    startBaileysConn().catch(err => {
+                      console.error("Failed during Baileys reconnect restart:", err);
                     });
-
-                    // Sync outbound reply log to Supabase
-                    const isSyncedOut = await syncToSupabase(shopId, sender || "unknown", aiResponse, 'outbound');
-                    if (isSyncedOut) {
-                      io.to(`shop_${shopId}`).emit("log", {
-                        type: "info",
-                        message: `[Supabase DB Sync] Persisted WhatsApp Outbound response to chat_logs`
-                      });
-                    }
-                  } catch (err) {
-                    console.error("Failed to send auto reply:", err);
-                  }
-                }, 1000);
+                  }, 5000);
+                }
+              } else if (connection === "open") {
+                console.log(`Baileys connection opened successfully for shop ${shopId}`);
+                const current = activeSessions.get(shopId);
+                if (current) {
+                  current.status = "connected";
+                  delete current.qrCode;
+                  activeSessions.set(shopId, current);
+                }
+                io.to(`shop_${shopId}`).emit("status_change", { status: "connected" });
+                io.to(`shop_${shopId}`).emit("log", {
+                  type: "success",
+                  message: `[WhatsApp Web Server] Successfully logged in using secure multi-file session auth!`
+                });
               }
-            }
-          });
+            });
 
-        } catch (error: any) {
-          console.error("Failed to initialize Baileys:", error);
-          io.to(`shop_${shopId}`).emit("log", {
-            type: "error",
-            message: `[Baileys Failed] Real Baileys boot crash: ${error.message}. Defaulting cleanly to High-Fidelity Simulation Module.`
-          });
-          
-          // Instantly fallback to simulator to guarantee flawless UI demonstration
-          const mockQR = `whatsapp-session-auth-challenge-mock-key-${shopId}-${Math.floor(Math.random() * 900000 + 100000)}`;
-          const current = activeSessions.get(shopId);
-          if (current) {
-            current.status = 'qr_received';
-            current.qrCode = mockQR;
-            activeSessions.set(shopId, current);
+            sock.ev.on("messages.upsert", async (m) => {
+              console.log(`Incoming message on shop ${shopId}:`, JSON.stringify(m, null, 2));
+              const msg = m.messages[0];
+              if (!msg.key.fromMe && msg.message) {
+                const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+                const sender = msg.key.remoteJid;
+                if (textMessage) {
+                  io.to(`shop_${shopId}`).emit("log", {
+                    type: "message",
+                    message: `[INCOMING] Message from ${sender}: "${textMessage}"`
+                  });
+
+                  // Sync inbound message log to Supabase
+                  const isSyncedIn = await syncToSupabase(shopId, sender || "unknown", textMessage, 'inbound');
+                  if (isSyncedIn) {
+                    io.to(`shop_${shopId}`).emit("log", {
+                      type: "info",
+                      message: `[Supabase DB Sync] Persisted WhatsApp Inbound conversation to chat_logs`
+                    });
+                  }
+
+                  // Query the configured OpenRouter LLM or fallback Match rules
+                  const aiResponse = await queryOpenRouter(shopId, textMessage);
+
+                  // Auto-reply with AI generated response
+                  setTimeout(async () => {
+                    try {
+                      await sock.sendMessage(sender!, { text: aiResponse });
+                      io.to(`shop_${shopId}`).emit("log", {
+                        type: "success",
+                        message: `[OUTBOUND AUTO-REPLY] ${aiResponse}`
+                      });
+
+                      // Sync outbound reply log to Supabase
+                      const isSyncedOut = await syncToSupabase(shopId, sender || "unknown", aiResponse, 'outbound');
+                      if (isSyncedOut) {
+                        io.to(`shop_${shopId}`).emit("log", {
+                          type: "info",
+                          message: `[Supabase DB Sync] Persisted WhatsApp Outbound response to chat_logs`
+                        });
+                      }
+                    } catch (err) {
+                      console.error("Failed to send auto reply:", err);
+                    }
+                  }, 1000);
+                }
+              }
+            });
+
+          } catch (error: any) {
+            console.error("Failed to initialize Baileys:", error);
+            io.to(`shop_${shopId}`).emit("log", {
+              type: "error",
+              message: `[Baileys Failed] Real Baileys boot crash: ${error.message}. Defaulting cleanly to High-Fidelity Simulation Module.`
+            });
+            
+            // Instantly fallback to simulator to guarantee flawless UI demonstration
+            const mockQR = `whatsapp-session-auth-challenge-mock-key-${shopId}-${Math.floor(Math.random() * 900000 + 100000)}`;
+            const current = activeSessions.get(shopId);
+            if (current) {
+              current.status = 'qr_received';
+              current.qrCode = mockQR;
+              activeSessions.set(shopId, current);
+            }
+            io.to(`shop_${shopId}`).emit("status_change", {
+              status: "qr_received",
+              qrCode: mockQR
+            });
+            io.to(`shop_${shopId}`).emit("log", {
+              type: "success",
+              message: `[Simulation System] Standby. Mock Whatsapp Web QR issued.`
+            });
           }
-          io.to(`shop_${shopId}`).emit("status_change", {
-            status: "qr_received",
-            qrCode: mockQR
-          });
-          io.to(`shop_${shopId}`).emit("log", {
-            type: "success",
-            message: `[Simulation System] Standby. Mock Whatsapp Web QR issued.`
-          });
-        }
+        };
+
+        // Primary trigger
+        startBaileysConn();
       }
     });
 
