@@ -20,10 +20,10 @@ const activeSessions = new Map<string, ClientSession>();
 const tenantConfigs = new Map<string, any>();
 
 // Helper function to query OpenRouter model
-async function queryOpenRouter(shopId: string, text: string, configInput?: any): Promise<string> {
+async function queryOpenRouter(shopId: string, text: string, io?: Server, configInput?: any): Promise<string> {
   const config = configInput || tenantConfigs.get(shopId) || {};
   const apiKey = config.openRouterKey || process.env.OPENROUTER_API_KEY;
-  const model = config.openRouterModel || process.env.OPENROUTER_MODEL || "meta-llama/llama-3-8b-instruct:free";
+  const initialModel = config.openRouterModel || process.env.OPENROUTER_MODEL || "meta-llama/llama-3.1-8b-instruct:free";
   const systemPrompt = config.systemPrompt || `You are a helpful assistant for ${shopId}.`;
 
   if (!apiKey) {
@@ -41,41 +41,74 @@ async function queryOpenRouter(shopId: string, text: string, configInput?: any):
     return `[Simulation AI Mode] Hello! Thank you for contacting "${shopId}". For advanced live OpenRouter replies, enter your API key or configure environment variables. Custom response for message: "${text}" is pending!`;
   }
 
-  try {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://webshoppingbot.io",
-        "X-Title": "Webshopping Bot"
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: text }
-        ],
-        temperature: 0.7,
-        max_tokens: 300
-      })
-    });
+  // Pool of modern free and stable models to transparently auto-heal/fallback
+  const modelsToTry = [
+    initialModel,
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "google/gemini-2.5-flash:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemma-2-9b-it:free"
+  ].filter((m, i, arr) => arr.indexOf(m) === i && m); // Unique, non-empty model names
 
-    const data = await res.json();
-    if (data.choices && data.choices[0] && data.choices[0].message) {
-      return data.choices[0].message.content.trim();
-    } else {
-      console.warn("OpenRouter API unexpected payload format:", data);
-      throw new Error(data.error?.message || "Invalid payload format");
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const currentModel = modelsToTry[i];
+    try {
+      if (i > 0 && io) {
+        io.to(`shop_${shopId}`).emit("log", {
+          type: "info",
+          message: `[OpenRouter Auto-Heal] Selected endpoint failed. Attempting fallback model: "${currentModel}"...`
+        });
+      }
+
+      console.log(`[OpenRouter API Dispatch] Sending query to model: ${currentModel}`);
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://webshoppingbot.io",
+          "X-Title": "Webshopping Bot"
+        },
+        body: JSON.stringify({
+          model: currentModel,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: text }
+          ],
+          temperature: 0.7,
+          max_tokens: 300
+        })
+      });
+
+      const data = await res.json();
+      if (data.choices && data.choices[0] && data.choices[0].message) {
+        return data.choices[0].message.content.trim();
+      } else if (data.error && (data.error.code === 404 || data.error.message?.includes("No endpoints found") || data.error.message?.includes("not found"))) {
+        console.warn(`[OpenRouter Model Warning] Model '${currentModel}' not found/active. Continuing queue search...`);
+        if (io) {
+          io.to(`shop_${shopId}`).emit("log", {
+            type: "warning",
+            message: `[OpenRouter Warning] Model "${currentModel}" is unavailable (HTTP 404). Trying next active fallback...`
+          });
+        }
+        continue;
+      } else {
+        console.warn("OpenRouter API unexpected payload format:", data);
+        throw new Error(data.error?.message || "Invalid payload format or billing limit reached");
+      }
+    } catch (error: any) {
+      console.error(`OpenRouter API error on model ${currentModel}:`, error);
+      if (i === modelsToTry.length - 1) {
+        return `[System Error from OpenRouter]: ${error.message || "Failed request after exploring fallbacks"}. Falls back to default shop rules.`;
+      }
     }
-  } catch (error: any) {
-    console.error("OpenRouter API dispatch error:", error);
-    return `[System Error from OpenRouter]: ${error.message || "Failed request"}. Falls back to default shop auto-reply queue.`;
   }
+
+  return `[System Error from OpenRouter]: Dynamic fallback queue exhausted. Please verify your OpenRouter API keys or balance.`;
 }
 
 // Sync conversation message log directly into Postgres Supabase tables
-async function syncToSupabase(shopId: string, sender: string, message: string, direction: 'inbound' | 'outbound', configInput?: any) {
+async function syncToSupabase(shopId: string, sender: string, message: string, direction: 'inbound' | 'outbound', io?: Server, configInput?: any) {
   const config = configInput || tenantConfigs.get(shopId) || {};
   const supabaseUrl = config.supabaseUrl || process.env.SUPABASE_URL;
   const supabaseKey = config.supabaseAnonKey || process.env.SUPABASE_ANON_KEY;
@@ -103,9 +136,27 @@ async function syncToSupabase(shopId: string, sender: string, message: string, d
         return true;
       } else {
         console.warn(`[Supabase DB] Failed to sync message to Supabase. HTTP Status: ${res.status}`);
+        if (io) {
+          let errorMsg = `[Supabase DB] Failed to sync message. HTTP Status: ${res.status}.`;
+          if (res.status === 404) {
+            errorMsg += ` Table 'chat_logs' does not exist! Please execute the CREATE TABLE SQL script (available in troubleshooting tips) in your Supabase SQL editor.`;
+          } else if (res.status === 401 || res.status === 403) {
+            errorMsg += ` Access denied. Verify that your supabase_anon_key is correct and RLS allows inserts.`;
+          }
+          io.to(`shop_${shopId}`).emit("log", {
+            type: "error",
+            message: errorMsg
+          });
+        }
       }
     } catch (e: any) {
       console.warn(`[Supabase DB Status] Could not connect to Supabase:`, e.message);
+      if (io) {
+        io.to(`shop_${shopId}`).emit("log", {
+          type: "error",
+          message: `[Supabase DB Status] Connection exception: ${e.message}`
+        });
+      }
     }
   }
   return false;
@@ -149,7 +200,7 @@ async function startServer() {
   app.post("/api/test-ai", async (req, res) => {
     const { shopId, userMessage, config } = req.body;
     try {
-      const reply = await queryOpenRouter(shopId, userMessage, config);
+      const reply = await queryOpenRouter(shopId, userMessage, undefined, config);
       res.json({ success: true, reply });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });
@@ -361,7 +412,7 @@ async function startServer() {
                   });
 
                   // Sync inbound message log to Supabase
-                  const isSyncedIn = await syncToSupabase(shopId, sender || "unknown", textMessage, 'inbound');
+                  const isSyncedIn = await syncToSupabase(shopId, sender || "unknown", textMessage, 'inbound', io);
                   if (isSyncedIn) {
                     io.to(`shop_${shopId}`).emit("log", {
                       type: "info",
@@ -370,7 +421,7 @@ async function startServer() {
                   }
 
                   // Query the configured OpenRouter LLM or fallback Match rules
-                  const aiResponse = await queryOpenRouter(shopId, textMessage);
+                  const aiResponse = await queryOpenRouter(shopId, textMessage, io);
 
                   // Auto-reply with AI generated response
                   setTimeout(async () => {
@@ -382,7 +433,7 @@ async function startServer() {
                       });
 
                       // Sync outbound reply log to Supabase
-                      const isSyncedOut = await syncToSupabase(shopId, sender || "unknown", aiResponse, 'outbound');
+                      const isSyncedOut = await syncToSupabase(shopId, sender || "unknown", aiResponse, 'outbound', io);
                       if (isSyncedOut) {
                         io.to(`shop_${shopId}`).emit("log", {
                           type: "info",
@@ -462,7 +513,7 @@ async function startServer() {
         });
         
         // Persist inbound event to Supabase if configured
-        const isSyncedIn = await syncToSupabase(currentShopId, sender, text, 'inbound');
+        const isSyncedIn = await syncToSupabase(currentShopId, sender, text, 'inbound', io);
         if (isSyncedIn) {
           io.to(`shop_${currentShopId}`).emit("log", {
             type: "info",
@@ -471,7 +522,7 @@ async function startServer() {
         }
 
         // Query the configured OpenRouter LLM or fallback Match rules
-        const aiReply = await queryOpenRouter(currentShopId, text);
+        const aiReply = await queryOpenRouter(currentShopId, text, io);
 
         // Output simulated automated bot reply
         setTimeout(async () => {
@@ -481,7 +532,7 @@ async function startServer() {
           });
 
           // Persist outbound event to Supabase if configured
-          const isSyncedOut = await syncToSupabase(currentShopId, sender, aiReply, 'outbound');
+          const isSyncedOut = await syncToSupabase(currentShopId, sender, aiReply, 'outbound', io);
           if (isSyncedOut) {
             io.to(`shop_${currentShopId}`).emit("log", {
               type: "info",
